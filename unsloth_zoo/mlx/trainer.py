@@ -1349,6 +1349,7 @@ class MLXTrainingConfig:
             "discopop_tau",
             "model_adapter_name",
             "ref_adapter_name",
+            "force_use_ref_model",
         }
         _field_names = {field.name for field in config_fields}
         copied_all_fields = (_field_names - _appended_fields) <= set(provided)
@@ -1444,6 +1445,8 @@ class MLXDPOConfig(MLXTrainingConfig):
     # ref_adapter_name is a saved adapter directory: an MLX model has one unnamed adapter set.
     model_adapter_name: str | None = field(default=None, kw_only=True)
     ref_adapter_name: str | None = field(default=None, kw_only=True)
+    # force_use_ref_model only silences the doubled-memory warning.
+    force_use_ref_model: bool = field(default=False, kw_only=True)
     disable_dropout: bool = field(default=True, kw_only=True)
     max_length: int | None = field(default=1024, kw_only=True)
     max_prompt_length: int | None = field(default=512, kw_only=True)
@@ -2087,6 +2090,8 @@ class MLXTrainer:
             ),
             ref_adapter_name=getattr(args, "ref_adapter_name", None),
             model_adapter_name=getattr(args, "model_adapter_name", None),
+            ref_model=getattr(self, "ref_model", None),
+            force_use_ref_model=bool(getattr(args, "force_use_ref_model", False)),
         )
 
     def __init__(
@@ -4700,6 +4705,13 @@ class MLXTrainer:
         try:
             from .loader import _keep_norm_parameters_float32
             _keep_norm_parameters_float32(model)
+            # A reference model reads the same prepared norms and unfused projections.
+            _reference_model = (
+                None if bool(getattr(args, "reference_free", False))
+                else getattr(self, "ref_model", None)
+            )
+            if _reference_model is not None:
+                _keep_norm_parameters_float32(_reference_model)
             _set_norm_output_cast_to_input_dtype(cast_norm_output, model)
             if cast_norm_output:
                 _main_print("Unsloth: Casting MLX norm outputs back to activation dtype.")
@@ -4989,6 +5001,10 @@ class MLXTrainer:
             # Full fine-tuning updates projections a fusion cached once.
             from .loader import _disable_fused_input_projections
             _unfused_projection_modules = _disable_fused_input_projections(model)
+            if _reference_model is not None:
+                _unfused_projection_modules += _disable_fused_input_projections(
+                    _reference_model,
+                )
             # Qwen2/2.5/3-VL language towers share the fused MRoPE kernel with
             # no VJP; flip it off so training takes the differentiable fallback.
             if any(t in model_type for t in ("qwen3_vl", "qwen2_vl", "qwen2_5_vl")):
@@ -6639,7 +6655,7 @@ class MLXTrainer:
 
                 defaults = self._generation_defaults
                 started = time.perf_counter()
-                def _decode(label):
+                def _decode(label, decode_model):
                     """Decode on every rank, or on none of them.
 
                     A rank that unwinds never reaches the
@@ -6650,7 +6666,8 @@ class MLXTrainer:
                     local_error = None
                     try:
                         result = generate_batch(
-                            model, self.tokenizer, requests, defaults=defaults,
+                            decode_model, self.tokenizer, requests,
+                            defaults=defaults,
                         )
                     except BaseException as error:
                         local_error = error
@@ -6672,7 +6689,7 @@ class MLXTrainer:
                         return None
                     return result
 
-                policy = _decode("policy")
+                policy = _decode("policy", model)
                 if policy is None:
                     self.last_generation_samples = []
                     return
@@ -6682,8 +6699,8 @@ class MLXTrainer:
                     _sampling_reference is not None
                     and not self._distributed_should_stop()
                 ):
-                    with _sampling_reference.activate(model):
-                        reference = _decode("reference")
+                    with _sampling_reference.activate(model) as reference_model:
+                        reference = _decode("reference", reference_model)
                     if reference is None:
                         # The policy half alone is indistinguishable from what an
                         # unreferenced objective publishes, hiding the failure.
@@ -8714,10 +8731,16 @@ class MLXORPOTrainer(MLXTrainer):
 
 
 class MLXDPOTrainer(MLXTrainer):
-    """MLX trainer for Direct Preference Optimization."""
+    """MLX trainer for Direct Preference Optimization; ``ref_model`` is a model of
+    its own to score against, else this model with its adapters disabled or, when
+    it trains them all, at its starting weights."""
 
     config_class = MLXDPOConfig
     preference_kind = "dpo"
+
+    def __init__(self, *args, ref_model=None, **kwargs):
+        self.ref_model = ref_model
+        super().__init__(*args, **kwargs)
 
 
 def _create_labeled_batches(dataset, tokenizer, mask_fn, batch_size,
