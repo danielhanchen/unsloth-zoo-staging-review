@@ -1451,12 +1451,10 @@ class MLXDPOConfig(MLXTrainingConfig):
     # ref_adapter_name is a saved adapter directory: an MLX model has one unnamed adapter set.
     model_adapter_name: str | None = field(default=None, kw_only=True)
     ref_adapter_name: str | None = field(default=None, kw_only=True)
-    # force_use_ref_model only silences the doubled-memory warning.
     force_use_ref_model: bool = field(default=False, kw_only=True)
     sync_ref_model: bool = field(default=False, kw_only=True)
     ref_model_mixup_alpha: float = field(default=0.6, kw_only=True)
     ref_model_sync_steps: int = field(default=512, kw_only=True)
-    # precompute_ref_batch_size defaults to the split's batch size.
     precompute_ref_log_probs: bool = field(default=False, kw_only=True)
     precompute_ref_batch_size: int | None = field(default=None, kw_only=True)
     disable_dropout: bool = field(default=True, kw_only=True)
@@ -4718,7 +4716,6 @@ class MLXTrainer:
         try:
             from .loader import _keep_norm_parameters_float32
             _keep_norm_parameters_float32(model)
-            # A reference model reads the same prepared norms and unfused projections.
             _reference_model = (
                 None if bool(getattr(args, "reference_free", False))
                 else getattr(self, "ref_model", None)
@@ -8825,9 +8822,7 @@ class MLXORPOTrainer(MLXTrainer):
 
 
 class MLXDPOTrainer(MLXTrainer):
-    """MLX trainer for Direct Preference Optimization; ``ref_model`` is a model of
-    its own to score against, else this model with its adapters disabled or, when
-    it trains them all, at its starting weights."""
+    """MLX trainer for Direct Preference Optimization."""
 
     config_class = MLXDPOConfig
     preference_kind = "dpo"
