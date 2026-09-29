@@ -30,6 +30,7 @@ import inspect
 import io
 import math
 import os
+import traceback
 import re
 import shutil
 import sys
@@ -576,6 +577,56 @@ def _message_matches_known_fallback(message, rule):
     return any(all(token in message for token in tokens) for tokens in token_sets)
 
 
+# Anchored on __init__: signature drift at our own call sites ("load_model() missing ...")
+# is not a config problem and must keep its traceback.
+_MLX_MISSING_ARGS_RE = re.compile(
+    r"\w*\.?__init__\(\) missing \d+ required positional arguments?:(?P<keys>.*)"
+)
+
+
+def _missing_mlx_config_keys(message):
+    """Required config fields config.json omitted: mlx-lm / mlx-vlm ``from_dict`` filter to
+    declared fields, so a missing no-default field fails in ``__init__``. [] otherwise."""
+    match = _MLX_MISSING_ARGS_RE.search(message)
+    if match is None:
+        return []
+    return re.findall(r"'([^']+)'", match.group("keys"))
+
+
+def _raise_if_incomplete_mlx_config(
+    model_name, model_type, message, error, library="mlx-lm",
+):
+    """Mirrored configs can drop required keys (lfm2 block_ff_dim, unsloth#7306); the raw
+    TypeError reads like missing MLX support, so name the config instead."""
+    keys = _missing_mlx_config_keys(message)
+    if not keys:
+        return
+    # Only config dataclasses: a model / processor __init__ missing an argument is not a
+    # config.json problem. Python 3.9 omits the class name, so check the raising frame.
+    owner = re.search(r"(\w+)\.__init__\(\)", message)
+    if owner is not None:
+        owner = owner.group(1)
+        if owner != "ModelArgs" and not owner.endswith("Config"):
+            return
+    else:
+        frames = traceback.extract_tb(error.__traceback__)
+        if not frames or frames[-1].name != "from_dict":
+            return
+    listed = ", ".join(repr(key) for key in keys)
+    plural = "keys" if len(keys) > 1 else "key"
+    # Nested dataclasses (mlx-vlm TextConfig / VisionConfig) name a sub-config's fields.
+    if owner is not None and owner not in ("ModelArgs", "ModelConfig"):
+        listed = f"{listed} (fields of {owner})"
+    raise ValueError(
+        f"Unsloth: {model_name}'s config.json is missing the {plural} {listed}, "
+        f"which {library}'s '{model_type or 'unknown'}' architecture requires and "
+        f"cannot default. This is an incomplete config.json in the model repo - "
+        f"MLX and Apple Silicon support are not the problem. Compare the config "
+        f"against the upstream repo this model was mirrored from and add the "
+        f"missing {plural}."
+    ) from error
+
+
 def _raise_if_qk_norm_version_gap(model_type, message, error):
     """A strict load rejecting q_norm / k_norm means mlx-lm / mlx-vlm is too old for
     this QK-norm arch; dropping those weights breaks the model, so raise instead."""
@@ -1088,6 +1139,9 @@ def _load_mlx_lm_with_strict_fallback(
             lazy=lazy,
             model_config=model_config,
         )
+    except TypeError as error:
+        _raise_if_incomplete_mlx_config(model_name, model_type, str(error), error)
+        raise
     except ValueError as error:
         message = str(error)
         # Active-layer QK-norm weights are load-bearing: never strict=False past
@@ -1223,12 +1277,18 @@ def _load_mlx_lm_distributed(
             allow_patterns=_mlx_lm_metadata_allow_patterns(),
         )
         with _temporary_mlx_lm_snapshot_view(model_path) as metadata_model_path:
-            model, config = load_model(
-                metadata_model_path,
-                lazy=True,
-                strict=False,
-                model_config=model_config,
-            )
+            try:
+                model, config = load_model(
+                    metadata_model_path,
+                    lazy=True,
+                    strict=False,
+                    model_config=model_config,
+                )
+            except TypeError as error:
+                _raise_if_incomplete_mlx_config(
+                    model_name, model_type, str(error), error
+                )
+                raise
 
             mode = _mlx_distributed_sharding_mode(
                 model,
@@ -1396,6 +1456,12 @@ def _load_mlx_vlm_with_extra_weight_filter(
     try:
         with _temporary_hf_token_env(hf_token):
             return vlm_load(model_name, **vlm_kwargs)
+    except TypeError as error:
+        # The retry below runs after a ValueError, so config already built: unguarded.
+        _raise_if_incomplete_mlx_config(
+            model_name, model_type, str(error), error, library="mlx-vlm",
+        )
+        raise
     except ValueError as error:
         message = str(error)
         # QK-norm weights are load-bearing: check before the extra-weight filter.
@@ -1521,6 +1587,9 @@ def _load_mlx_vlm_distributed(
         ) from error
     except TypeError as error:
         message = str(error)
+        _raise_if_incomplete_mlx_config(
+            model_name, model_type, message, error, library="mlx-vlm",
+        )
         if "tensor_group" not in message and "pipeline_group" not in message:
             raise
         raise ImportError(
@@ -9071,6 +9140,13 @@ class FastMLXModel:
                             revision=revision,
                             **extra_kwargs,
                         )
+                    except TypeError as error:
+                        # Bypasses the extra-weight filter's guard.
+                        _raise_if_incomplete_mlx_config(
+                            model_name, model_type, str(error), error,
+                            library="mlx-vlm",
+                        )
+                        raise
                     except ValueError as error:
                         # Pre-quantize load bypasses the extra-weight filter, so
                         # surface the QK-norm version gap here too.
